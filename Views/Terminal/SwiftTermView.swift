@@ -60,10 +60,11 @@ struct SwiftTermView: UIViewRepresentable {
 
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate {
         // Hold direct reference to SSHClient (it's a class/ObservableObject)
-        var sshClient: SSHClient
+        private let sshClient: SSHClient
         // Strong reference to prevent premature deallocation
         var terminalView: SwiftTerm.TerminalView?
-        private var isSetup = false
+        // Track if this coordinator is still valid
+        private var isValid = true
 
         init(sshClient: SSHClient) {
             self.sshClient = sshClient
@@ -71,24 +72,35 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         deinit {
-            // Clear the callback to prevent crashes after deallocation
+            invalidate()
+        }
+
+        /// Invalidate this coordinator - called on deinit or when view is removed
+        func invalidate() {
+            isValid = false
             sshClient.onDataReceived = nil
+            terminalView = nil
         }
 
         // MARK: - SSH Client Integration
 
         func setupSSHClient() {
-            // Only setup once to avoid multiple callbacks
-            guard !isSetup else { return }
-            isSetup = true
+            // Always set up fresh callback (previous coordinator's deinit will clear old one)
+            guard isValid else { return }
 
             // Wire SSH output to terminal.feed()
-            // Capture self weakly to avoid retain cycles
+            // Use unique identifier to verify callback is still valid
+            let coordinatorId = ObjectIdentifier(self)
+
             sshClient.onDataReceived = { [weak self] bytes in
-                // Must check self and terminalView inside the async block
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    guard let terminal = self.terminalView else { return }
+                DispatchQueue.main.async {
+                    // Verify this is still the active coordinator
+                    guard let self = self,
+                          self.isValid,
+                          ObjectIdentifier(self) == coordinatorId,
+                          let terminal = self.terminalView else {
+                        return
+                    }
                     terminal.feed(byteArray: ArraySlice(bytes))
                 }
             }
@@ -98,6 +110,8 @@ struct SwiftTermView: UIViewRepresentable {
 
         /// Called when user types in the terminal - sends data to SSH
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
+            // Verify coordinator is still valid
+            guard isValid else { return }
             // Safety check - ensure we have a valid connection
             guard case .connected = sshClient.connectionState else { return }
             guard !data.isEmpty else { return }
@@ -109,22 +123,24 @@ struct SwiftTermView: UIViewRepresentable {
 
         /// Called when terminal is scrolled
         func scrolled(source: SwiftTerm.TerminalView, position: Double) {
-            // Optional: handle scroll position changes
+            guard isValid else { return }
         }
 
         /// Called when terminal title changes (via OSC escape sequence)
         func setTerminalTitle(source: SwiftTerm.TerminalView, title: String) {
-            // Optional: update navigation title
+            guard isValid else { return }
         }
 
         /// Called when terminal size changes
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
+            guard isValid else { return }
             guard newCols > 0, newRows > 0 else { return }
             sshClient.resizeTerminal(cols: newCols, rows: newRows)
         }
 
         /// Called when clipboard should be set
         func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
+            guard isValid else { return }
             if let string = String(data: content, encoding: .utf8) {
                 UIPasteboard.general.string = string
             }
@@ -132,11 +148,12 @@ struct SwiftTermView: UIViewRepresentable {
 
         /// Called when host current directory changes
         func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {
-            // Optional: track current directory
+            guard isValid else { return }
         }
 
         /// Request to open a URL
         func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String: String]) {
+            guard isValid else { return }
             if let url = URL(string: link) {
                 UIApplication.shared.open(url)
             }
@@ -144,7 +161,7 @@ struct SwiftTermView: UIViewRepresentable {
 
         /// Called when a range of text was modified
         func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {
-            // Optional: handle range changes for accessibility
+            guard isValid else { return }
         }
     }
 }
