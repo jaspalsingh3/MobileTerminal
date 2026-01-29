@@ -149,7 +149,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Author
 
-**Jaspal Singh**
+**Jaspal Singh** - [SaveDelete.com](https://savedelete.com)
 
 ---
 
