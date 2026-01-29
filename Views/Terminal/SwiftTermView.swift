@@ -18,7 +18,12 @@ struct SwiftTermView: UIViewRepresentable {
 
         // Configure terminal appearance
         terminalView.backgroundColor = .black
-
+        
+        // Configure terminal behavior
+        let term = terminalView.getTerminal()
+        // Disable mouse reporting if it's causing issues, or keep standard
+        // Some TUI apps get confused by too much reporting on mobile
+        
         // Set font
         let font = UIFont.monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
         terminalView.font = font
@@ -45,26 +50,27 @@ struct SwiftTermView: UIViewRepresentable {
         if terminalView.font != newFont {
             terminalView.font = newFont
         }
+    }
 
-        // Ensure terminal fills its container
-        DispatchQueue.main.async {
-            if let superview = terminalView.superview {
-                terminalView.frame = superview.bounds
-            }
-        }
+    static func dismantleUIView(_ uiView: SwiftTerm.TerminalView, coordinator: Coordinator) {
+        // Clean up when view is removed from hierarchy
+        coordinator.cleanup()
+        uiView.terminalDelegate = nil
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(sshClient: sshClient)
     }
 
+    // MARK: - Coordinator
+
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate {
-        // Hold direct reference to SSHClient (it's a class/ObservableObject)
         private let sshClient: SSHClient
-        // Strong reference to prevent premature deallocation
         var terminalView: SwiftTerm.TerminalView?
-        // Track if this coordinator is still valid
-        private var isValid = true
+        private var hasBeenCleaned = false
+        
+        // Serial queue for terminal operations to ensure order and thread safety
+        private let terminalQueue = DispatchQueue(label: "com.mobileterminal.terminalQueue")
 
         init(sshClient: SSHClient) {
             self.sshClient = sshClient
@@ -72,96 +78,110 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         deinit {
-            invalidate()
+            terminalView = nil
         }
 
-        /// Invalidate this coordinator - called on deinit or when view is removed
-        func invalidate() {
-            isValid = false
+        /// Clean up - called when view is dismantled
+        func cleanup() {
+            hasBeenCleaned = true
             sshClient.onDataReceived = nil
             terminalView = nil
+        }
+        
+        func resetTerminal() {
+            terminalQueue.async { [weak self] in
+                DispatchQueue.main.async {
+                    self?.terminalView?.getTerminal().resetToInitialState()
+                }
+            }
         }
 
         // MARK: - SSH Client Integration
 
         func setupSSHClient() {
-            // Always set up fresh callback (previous coordinator's deinit will clear old one)
-            guard isValid else { return }
-
-            // Wire SSH output to terminal.feed()
-            // Use unique identifier to verify callback is still valid
-            let coordinatorId = ObjectIdentifier(self)
+            guard !hasBeenCleaned else { return }
 
             sshClient.onDataReceived = { [weak self] bytes in
-                DispatchQueue.main.async {
-                    // Verify this is still the active coordinator
-                    guard let self = self,
-                          self.isValid,
-                          ObjectIdentifier(self) == coordinatorId,
-                          let terminal = self.terminalView else {
-                        return
-                    }
-                    terminal.feed(byteArray: ArraySlice(bytes))
+                guard let self = self else { return }
+                self.terminalQueue.async {
+                    self.feedTerminal(bytes: bytes)
                 }
+            }
+            
+            sshClient.onResetRequested = { [weak self] in
+                self?.resetTerminal()
+            }
+        }
+
+        private func feedTerminal(bytes: [UInt8]) {
+            // Note: Must be called from terminalQueue or a thread-safe manner
+            guard !hasBeenCleaned,
+                  let terminal = terminalView else {
+                return
+            }
+            
+            // Still dispatch to main for the actual UIKit-backed terminal view update
+            // but the processing is now serialized through terminalQueue
+            DispatchQueue.main.async {
+                guard terminal.window != nil else { return }
+                terminal.feed(byteArray: ArraySlice(bytes))
             }
         }
 
         // MARK: - TerminalViewDelegate
 
-        /// Called when user types in the terminal - sends data to SSH
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
-            // Verify coordinator is still valid
-            guard isValid else { return }
-            // Safety check - ensure we have a valid connection
-            guard case .connected = sshClient.connectionState else { return }
+            // Copy data immediately to avoid ArraySlice lifecycle issues
             guard !data.isEmpty else { return }
-
-            // Copy data before sending to avoid issues with ArraySlice lifecycle
             let dataToSend = Array(data)
-            sshClient.sendRawData(dataToSend)
+
+            // Dispatch to main thread to ensure thread safety
+            // SwiftTerm may call this from any thread
+            if Thread.isMainThread {
+                guard !hasBeenCleaned else { return }
+                sshClient.sendRawData(dataToSend)
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, !self.hasBeenCleaned else { return }
+                    self.sshClient.sendRawData(dataToSend)
+                }
+            }
         }
 
-        /// Called when terminal is scrolled
         func scrolled(source: SwiftTerm.TerminalView, position: Double) {
-            guard isValid else { return }
+            // No action needed
         }
 
-        /// Called when terminal title changes (via OSC escape sequence)
         func setTerminalTitle(source: SwiftTerm.TerminalView, title: String) {
-            guard isValid else { return }
+            // No action needed
         }
 
-        /// Called when terminal size changes
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
-            guard isValid else { return }
+            guard !hasBeenCleaned else { return }
             guard newCols > 0, newRows > 0 else { return }
-            sshClient.resizeTerminal(cols: newCols, rows: newRows)
+            
+            terminalQueue.async { [weak self] in
+                self?.sshClient.resizeTerminal(cols: newCols, rows: newRows)
+            }
         }
 
-        /// Called when clipboard should be set
         func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
-            guard isValid else { return }
             if let string = String(data: content, encoding: .utf8) {
                 UIPasteboard.general.string = string
             }
         }
 
-        /// Called when host current directory changes
         func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {
-            guard isValid else { return }
+            // No action needed
         }
 
-        /// Request to open a URL
         func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String: String]) {
-            guard isValid else { return }
-            if let url = URL(string: link) {
-                UIApplication.shared.open(url)
-            }
+            guard let url = URL(string: link) else { return }
+            UIApplication.shared.open(url)
         }
 
-        /// Called when a range of text was modified
         func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {
-            guard isValid else { return }
+            // No action needed
         }
     }
 }

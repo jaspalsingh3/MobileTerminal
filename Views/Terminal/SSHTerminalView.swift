@@ -32,6 +32,7 @@ struct SSHTerminalView: View {
                     sshClient: sshClient,
                     fontSize: sessionManager.fontSize
                 )
+                .id("terminal-\(server.id)") // Ensure fresh view identity for new servers
                 .frame(width: geometry.size.width, height: geometry.size.height)
             }
             .background(SwiftUI.Color.black)

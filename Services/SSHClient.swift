@@ -16,7 +16,6 @@ import NIOSSH
 
 final class SSHClient: ObservableObject {
     @Published var connectionState: SSHConnectionState = .disconnected
-    @Published var outputBuffer: String = ""
     @Published var errorMessage: String?
 
     private var sshClient: Citadel.SSHClient?
@@ -25,8 +24,10 @@ final class SSHClient: ObservableObject {
 
     // Raw data callback for SwiftTerm integration
     var onDataReceived: (([UInt8]) -> Void)?
+    var onResetRequested: (() -> Void)?
 
     // Terminal size (updated by SwiftTermView)
+    // Default to standard 80x24 which is safer for TUI initial layout
     private(set) var terminalCols: Int = 80
     private(set) var terminalRows: Int = 24
 
@@ -35,6 +36,9 @@ final class SSHClient: ObservableObject {
     private var port: Int = 22
     private var username: String = ""
     private var authMethod: SSHAuthMethod = .password("")
+    
+    // Sequential task for sending data to ensure order and avoid concurrent writes
+    private var lastWriteTask: Task<Void, Never>?
 
     enum SSHAuthMethod {
         case password(String)
@@ -61,6 +65,7 @@ final class SSHClient: ObservableObject {
 
     deinit {
         sessionTask?.cancel()
+        lastWriteTask?.cancel()
     }
 
     // MARK: - Connection
@@ -156,18 +161,17 @@ final class SSHClient: ObservableObject {
     private func establishConnection() async {
         await MainActor.run {
             connectionState = .connecting
-            outputBuffer = ""
             errorMessage = nil
         }
 
-        await appendOutput("Connecting to \(host):\(port)...\n")
+        await logToTerminal("Connecting to \(host):\(port)...\r\n")
 
         do {
             // Create SSH client based on auth method
             await MainActor.run {
                 connectionState = .authenticating
             }
-            await appendOutput("Authenticating as \(username)...\n")
+            await logToTerminal("Authenticating as \(username)...\r\n")
 
             switch authMethod {
             case .password(let password):
@@ -186,7 +190,7 @@ final class SSHClient: ObservableObject {
                 // Try Ed25519 first (most common modern key type)
                 do {
                     let ed25519Key = try Curve25519.Signing.PrivateKey(sshEd25519: keyString)
-                    await appendOutput("Using Ed25519 key authentication\n")
+                    await logToTerminal("Using Ed25519 key authentication\r\n")
                     sshClient = try await Citadel.SSHClient.connect(
                         host: host,
                         port: port,
@@ -198,7 +202,7 @@ final class SSHClient: ObservableObject {
                     // Try RSA
                     do {
                         let rsaKey = try Insecure.RSA.PrivateKey(sshRsa: keyString)
-                        await appendOutput("Using RSA key authentication\n")
+                        await logToTerminal("Using RSA key authentication\r\n")
                         sshClient = try await Citadel.SSHClient.connect(
                             host: host,
                             port: port,
@@ -212,8 +216,8 @@ final class SSHClient: ObservableObject {
                 }
             }
 
-            await appendOutput("SSH connection established!\n")
-            await appendOutput("Opening interactive shell...\n")
+            await logToTerminal("SSH connection established!\r\n")
+            await logToTerminal("Opening interactive shell...\r\n")
 
             // Start persistent PTY shell session
             try await startShellSession()
@@ -232,10 +236,10 @@ final class SSHClient: ObservableObject {
     private func startShellSession() async throws {
         guard let client = sshClient else { return }
 
-        // Use stored terminal size or mobile-friendly defaults
-        // iPhone screens typically fit 45-50 columns at readable font sizes
-        let cols = terminalCols > 0 ? terminalCols : 50
-        let rows = terminalRows > 0 ? terminalRows : 30
+        // Use stored terminal size or standard defaults
+        // Using standard 80x24 as a safer fallback than 50
+        let cols = terminalCols > 0 ? terminalCols : 80
+        let rows = terminalRows > 0 ? terminalRows : 24
 
         // Create PTY request with dynamic size
         let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
@@ -274,20 +278,12 @@ final class SSHClient: ObservableObject {
                                     self.onDataReceived?(bytes)
                                 }
                             }
-                            // Also append to outputBuffer for backwards compatibility
-                            if let text = buffer.getString(at: buffer.readerIndex, length: buffer.readableBytes) {
-                                await self.appendOutput(text)
-                            }
                         case .stderr(let buffer):
                             // Get raw bytes for SwiftTerm
                             if let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) {
                                 await MainActor.run {
                                     self.onDataReceived?(bytes)
                                 }
-                            }
-                            // Also append to outputBuffer for backwards compatibility
-                            if let text = buffer.getString(at: buffer.readerIndex, length: buffer.readableBytes) {
-                                await self.appendOutput(text)
                             }
                         }
                     }
@@ -310,70 +306,74 @@ final class SSHClient: ObservableObject {
             connectionState = .error(message)
             errorMessage = message
         }
-        await appendOutput("\n\(message)\n")
+        await logToTerminal("\r\n\(message)\r\n")
+    }
+
+    private func logToTerminal(_ message: String) async {
+        let bytes = Array(message.utf8)
+        await MainActor.run {
+            self.onDataReceived?(bytes)
+        }
     }
 
     // MARK: - Data Transmission
 
     func send(_ command: String) {
-        guard connectionState == .connected, let writer = stdinWriter else { return }
-
+        guard connectionState == .connected, stdinWriter != nil else { return }
         let data = command + "\n"
-
-        Task {
-            do {
-                var buffer = ByteBufferAllocator().buffer(capacity: data.utf8.count)
-                buffer.writeString(data)
-                try await writer.write(buffer)
-            } catch {
-                await handleError("Failed to send: \(error.localizedDescription)")
-            }
-        }
+        enqueueWrite(data: Array(data.utf8))
     }
 
     func sendControlSequence(_ sequence: String) {
-        // Capture writer reference before async work
-        guard connectionState == .connected, let writer = stdinWriter else { return }
-
-        // Explicitly capture writer to ensure it's retained
-        let capturedWriter = writer
-        Task {
-            do {
-                var buffer = ByteBufferAllocator().buffer(capacity: sequence.utf8.count)
-                buffer.writeString(sequence)
-                try await capturedWriter.write(buffer)
-            } catch {
-                print("Failed to send control sequence: \(error)")
-            }
-        }
+        guard connectionState == .connected, stdinWriter != nil else { return }
+        enqueueWrite(data: Array(sequence.utf8))
     }
 
     /// Send raw bytes to SSH (used by SwiftTerm for keyboard input)
     func sendRawData(_ data: [UInt8]) {
-        // Capture writer reference before async work
-        guard connectionState == .connected, let writer = stdinWriter else { return }
+        guard connectionState == .connected, let _ = stdinWriter else { return }
+        guard !data.isEmpty else { return }
+        enqueueWrite(data: data)
+    }
 
-        // Explicitly capture writer to ensure it's retained
-        let capturedWriter = writer
-        Task {
+    /// Helper to enqueue writes sequentially to ensure order and avoid race conditions
+    private func enqueueWrite(data: [UInt8]) {
+        guard let writer = stdinWriter else { return }
+        
+        // Chain the new write task to the previous one
+        let previousTask = lastWriteTask
+        lastWriteTask = Task { [weak self] in
+            // Wait for previous write to complete
+            _ = await previousTask?.result
+            
+            guard self != nil else { return }
+            
             do {
                 var buffer = ByteBufferAllocator().buffer(capacity: data.count)
                 buffer.writeBytes(data)
-                try await capturedWriter.write(buffer)
+                try await writer.write(buffer)
             } catch {
-                print("Failed to send raw data: \(error)")
+                print("Failed to write to SSH: \(error)")
             }
         }
     }
 
     /// Update terminal size (called when SwiftTermView resizes)
     func resizeTerminal(cols: Int, rows: Int) {
+        let changed = terminalCols != cols || terminalRows != rows
         terminalCols = cols
         terminalRows = rows
-        // Note: Citadel doesn't support window-change requests after session start
-        // The terminal will use the initial size from PTY request
-        // For a full implementation, you'd need to send SSH_MSG_CHANNEL_REQUEST
-        // with "window-change" type, but Citadel's API doesn't expose this
+        
+        if changed, connectionState == .connected {
+            Task {
+                try? await stdinWriter?.changeSize(
+                    cols: cols,
+                    rows: rows,
+                    pixelWidth: 0,
+                    pixelHeight: 0
+                )
+            }
+        }
     }
 
     // MARK: - Disconnect
@@ -381,6 +381,8 @@ final class SSHClient: ObservableObject {
     func disconnect() {
         sessionTask?.cancel()
         sessionTask = nil
+        lastWriteTask?.cancel()
+        lastWriteTask = nil
         stdinWriter = nil
 
         Task {
@@ -391,54 +393,10 @@ final class SSHClient: ObservableObject {
         Task { @MainActor in
             connectionState = .disconnected
         }
-
-        Task {
-            await appendOutput("\nConnection closed.\n")
-        }
-    }
-
-    // MARK: - Output
-
-    private func appendOutput(_ text: String) async {
-        let cleanText = stripANSIEscapeCodes(text)
-        await MainActor.run {
-            outputBuffer += cleanText
-        }
-    }
-
-    /// Strip ANSI escape codes from terminal output
-    private func stripANSIEscapeCodes(_ text: String) -> String {
-        // Match various ANSI/terminal escape sequences:
-        // - CSI sequences: ESC [ ... (letter)
-        // - OSC sequences: ESC ] ... BEL
-        // - Character set: ESC ( B, ESC ) B, etc.
-        // - Other escapes: ESC followed by various characters
-        let patterns = [
-            "\u{1B}\\[[0-9;?]*[A-Za-z]",      // CSI sequences (colors, cursor, etc.)
-            "\u{1B}\\][^\u{07}]*\u{07}",      // OSC sequences (title, etc.)
-            "\u{1B}\\][^\u{1B}]*\u{1B}\\\\",  // OSC with ST terminator
-            "\u{1B}[()][AB0-2]",               // Character set selection
-            "\u{1B}[=>]",                      // Keypad modes
-            "\u{1B}[78]",                      // Save/restore cursor
-            "\u{1B}[DMEH]",                    // Line operations
-            "\\(B",                            // Stray character set markers
-        ]
-
-        var result = text
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-                let range = NSRange(result.startIndex..., in: result)
-                result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-            }
-        }
-
-        return result
     }
 
     func clearOutput() {
-        Task { @MainActor in
-            outputBuffer = ""
-        }
+        onResetRequested?()
     }
 
     // MARK: - Key Normalization
