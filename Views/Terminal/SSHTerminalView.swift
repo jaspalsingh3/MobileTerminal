@@ -12,7 +12,6 @@ import UIKit
 struct SSHTerminalView: View {
     let server: ServerConnection
 
-    @StateObject private var sshClient = SSHClient()
     @StateObject private var sessionManager = TerminalSessionManager.shared
     @StateObject private var voiceService = VoiceCommandService()
     @StateObject private var historyManager = CommandHistoryManager.shared
@@ -23,6 +22,10 @@ struct SSHTerminalView: View {
     @State private var keepScreenAwake = true
 
     @Environment(\.dismiss) private var dismiss
+    
+    private var sshClient: SSHClient {
+        sessionManager.prepareSession(for: server)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -111,14 +114,18 @@ struct SSHTerminalView: View {
             Text("Enter password for \(server.name)")
         }
         .onAppear {
-            connectToServer()
+            if !sessionManager.isConnected {
+                connectToServer()
+            }
             // Keep screen awake to maintain SSH session
             if keepScreenAwake {
                 UIApplication.shared.isIdleTimerDisabled = true
             }
         }
         .onDisappear {
-            sshClient.disconnect()
+            // Remove hard disconnect to allow background persistence
+            // sessionTask stays alive in the background
+            
             // Re-enable screen sleep
             UIApplication.shared.isIdleTimerDisabled = false
         }

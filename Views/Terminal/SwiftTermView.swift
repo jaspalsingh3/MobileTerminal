@@ -120,12 +120,47 @@ struct SwiftTermView: UIViewRepresentable {
                 return
             }
             
+            // Filter problematic escape sequences that trigger the SwiftTerm crash
+            // The crash occurs during cursor restoration (ESC 7 / ESC 8 or ESC [ u)
+            // if the saved state is invalid or out of bounds.
+            let filteredBytes = filterProblematicSequences(bytes)
+            
             // Still dispatch to main for the actual UIKit-backed terminal view update
             // but the processing is now serialized through terminalQueue
             DispatchQueue.main.async {
                 guard terminal.window != nil else { return }
-                terminal.feed(byteArray: ArraySlice(bytes))
+                terminal.feed(byteArray: ArraySlice(filteredBytes))
             }
+        }
+        
+        private func filterProblematicSequences(_ bytes: [UInt8]) -> [UInt8] {
+            // We search for DEC Save/Restore Cursor (ESC 7 / ESC 8)
+            // and ANSI Restore Cursor (ESC [ u)
+            // which are known to cause out-of-bounds crashes in SwiftTerm's Buffer.y setter
+            // ESC is 0x1B (27)
+            var result = [UInt8]()
+            result.reserveCapacity(bytes.count)
+            
+            var i = 0
+            while i < bytes.count {
+                if bytes[i] == 0x1B && i + 1 < bytes.count {
+                    let next = bytes[i+1]
+                    // 0x37 is '7' (DECSC), 0x38 is '8' (DECRC)
+                    if next == 0x38 { // DECRC
+                        i += 2
+                        continue
+                    }
+                    
+                    // ESC [ u (CSI u)
+                    if next == 0x5B && i + 2 < bytes.count && bytes[i+2] == 0x75 {
+                        i += 3
+                        continue
+                    }
+                }
+                result.append(bytes[i])
+                i += 1
+            }
+            return result
         }
 
         // MARK: - TerminalViewDelegate
